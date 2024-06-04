@@ -81,10 +81,12 @@ func refreshRepo(cacheBase string, r ConfigRepo, state *State) *git.Repository {
 	}
 
 	// do initial clone
-	return must(git.PlainClone(dir, true, &git.CloneOptions{
+	repo := must(git.PlainClone(dir, true, &git.CloneOptions{
 		URL:    r.Url,
 		Mirror: true,
 	}))
+	loadTags(r, repo, state)
+	return repo
 }
 
 func loadTags(r ConfigRepo, repo *git.Repository, state *State) {
