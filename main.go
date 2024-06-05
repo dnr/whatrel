@@ -4,17 +4,20 @@ import (
 	"bytes"
 	"encoding/gob"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/module"
+	"golang.org/x/term"
 
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
@@ -73,9 +76,9 @@ type (
 )
 
 var (
-	tagAge          = flag.Int("age", 30, "how many days back to list tags")
-	refreshInterval = flag.Duration("refresh", 15*time.Minute, "how often to refresh git repo cache")
-	refreshState    = flag.Bool("refresh_state", false, "")
+	// tagAge          = flag.Int("age", 30, "how many days back to list tags")
+	refreshInterval = flag.Duration("refresh_interval", time.Hour, "how often to refresh git repo cache")
+	resetState      = flag.Bool("reset", false, "")
 
 	versionTagRe = regexp.MustCompile("^v[0-9]")
 	digitsRe     = regexp.MustCompile("^[0-9]+$")
@@ -90,6 +93,25 @@ func fatalIfErr(err error) {
 func must[T any](t T, err error) T {
 	fatalIfErr(err)
 	return t
+}
+
+var _re_submpath = regexp.MustCompile(`^\[submodule "([^"]+)"\]$`)
+var _re_submurl = regexp.MustCompile(`url\s*=\s*(\S*)`)
+
+func parseGitModules(contents string) (map[string]string, error) {
+	out := make(map[string]string) // path -> url
+	var path string
+	for _, line := range strings.Split(contents, "\n") {
+		if m := _re_submpath.FindStringSubmatch(line); m != nil {
+			path = m[1]
+		} else if m := _re_submurl.FindStringSubmatch(line); m != nil {
+			if path == "" {
+				return nil, errors.New("url without path")
+			}
+			out[path] = m[1]
+		}
+	}
+	return out, nil
 }
 
 func (w *whatrel) loadRepo(cacheBase string, r *repo) {
@@ -124,7 +146,7 @@ func (w *whatrel) loadRepo(cacheBase string, r *repo) {
 }
 
 func (w *whatrel) loadTags(r *repo) {
-	if !r.refreshedRepo && !*refreshState {
+	if !r.refreshedRepo && !*resetState {
 		return
 	}
 	log.Println("loading tags on", r.cfg.Name)
@@ -149,7 +171,7 @@ func (w *whatrel) loadTags(r *repo) {
 }
 
 func (w *whatrel) loadCommits(r *repo) {
-	if !r.newTags && !*refreshState {
+	if !r.newTags && !*resetState {
 		return
 	}
 	log.Println("loading commits on", r.cfg.Name)
@@ -163,7 +185,11 @@ func (w *whatrel) loadCommit(r *repo, commit plumbing.Hash) {
 		return
 	}
 
-	c := must(r.git.CommitObject(commit))
+	c, err := r.git.CommitObject(commit)
+	if err != nil {
+		log.Printf("can't find commit %s in %s", commit, r.cfg.Name)
+		return
+	}
 
 	title, _, _ := strings.Cut(c.Message, "\n")
 
@@ -174,14 +200,14 @@ func (w *whatrel) loadCommit(r *repo, commit plumbing.Hash) {
 
 	// get go.mod if present
 	deps := make(map[string]plumbing.Hash)
-	if gomod, err := c.File("go.mod"); err == nil {
-		if mod, err := modfile.ParseLax("go.mod", []byte(must(gomod.Contents())), nil); err == nil {
+	if f, err := c.File("go.mod"); err == nil {
+		if mod, err := modfile.ParseLax("go.mod", []byte(must(f.Contents())), nil); err == nil {
 			for _, req := range mod.Require {
 				p, v := req.Mod.Path, req.Mod.Version
 				// find in state
 				if depR := w.byGoMod[p]; depR != nil {
 					if v == "" {
-						log.Printf("version for %s in %s is empty", p, r.cfg.Name)
+						log.Printf("version for %s in %s is empty", depR.cfg.Name, r.cfg.Name)
 					} else if module.IsPseudoVersion(v) {
 						rev := must(module.PseudoVersionRev(v))
 						revBytes := must(hex.DecodeString(rev))
@@ -189,19 +215,31 @@ func (w *whatrel) loadCommit(r *repo, commit plumbing.Hash) {
 						if len(hashes) == 1 {
 							deps[depR.cfg.Name] = hashes[0]
 						} else {
-							log.Printf("version for %s in %s is %s, but found %d hashes", p, r.cfg.Name, v, len(hashes))
+							log.Printf("version for %s in %s is %s, but found %d hashes", depR.cfg.Name, r.cfg.Name, v, len(hashes))
 						}
 					} else {
 						if hash, ok := depR.st.Tags[v]; ok {
 							deps[depR.cfg.Name] = hash
 						} else {
-							log.Printf("can't find reference in go.mod:", req.Mod.String())
+							log.Printf("version for %s in %s is %s, but is unknown tag", depR.cfg.Name, r.cfg.Name, v)
 						}
 					}
 				}
 			}
 		} else {
 			log.Println("error parsing go.mod from commit", c.Hash)
+		}
+	}
+
+	if f, err := c.File(".gitmodules"); err == nil {
+		if mods, err := parseGitModules(must(f.Contents())); err == nil {
+			for path, url := range mods {
+				if depR := w.findByUrl(url); depR != nil {
+					deps[depR.cfg.Name] = must(must(c.Tree()).FindEntry(path)).Hash
+				}
+			}
+		} else {
+			log.Println("error parsing .gitmodules from commit", c.Hash)
 		}
 	}
 
@@ -218,16 +256,21 @@ func (w *whatrel) loadCommit(r *repo, commit plumbing.Hash) {
 	}
 }
 
-func (w *whatrel) findTags(arg string) []string {
+func (w *whatrel) findByUrl(url string) *repo {
+	url = strings.TrimSuffix(url, ".git")
+	for _, r := range w.repos {
+		if strings.TrimSuffix(r.cfg.Url, ".git") == url {
+			return r
+		}
+	}
+	return nil
+}
+
+func (w *whatrel) findTags(arg string) {
 	// form: repo#pr or repo#text
 	name, pr, found := strings.Cut(arg, "#")
 	if !found {
 		log.Fatalln("arg must be in form repo#pr or repo#text")
-	}
-
-	repoState := w.st.Repos[name]
-	if repoState == nil {
-		log.Fatalln("unknown repo", name)
 	}
 
 	var matchTitle func(string) bool
@@ -242,37 +285,72 @@ func (w *whatrel) findTags(arg string) []string {
 		}
 	}
 
-	cache := make(map[plumbing.Hash]bool, 10000)
+	type key struct {
+		c plumbing.Hash
+		n [12]byte
+	}
+	cache := make(map[key]bool, 10000)
 
-	var checkCommit func(plumbing.Hash) bool
-	checkCommit = func(c plumbing.Hash) bool {
-		if val, ok := cache[c]; ok {
+	var checkCommit func(r *repo, c plumbing.Hash) bool
+	checkCommit = func(r *repo, c plumbing.Hash) bool {
+		k := key{c: c}
+		copy(k.n[:], r.cfg.Name)
+
+		if val, ok := cache[k]; ok {
 			return val
 		}
-		ci := repoState.Commits[c]
-		if matchTitle(ci.Title) {
-			cache[c] = true
+		ci := r.st.Commits[c]
+		if r.cfg.Name == name && matchTitle(ci.Title) {
+			cache[k] = true
 			return true
-		}
-		if len(ci.Parents) == 0 {
-			cache[c] = false
-			return false
 		}
 		val := false
 		for _, p := range ci.Parents {
-			val = val || checkCommit(p)
+			if checkCommit(r, p) {
+				val = true
+				break
+			}
 		}
-		cache[c] = val
+		for depName, depC := range ci.Deps {
+			if checkCommit(w.repos[depName], depC) {
+				val = true
+				break
+			}
+		}
+		cache[k] = val
 		return val
 	}
 
-	var out []string
-	for tag, commit := range repoState.Tags {
-		if checkCommit(commit) {
-			out = append(out, tag)
+	width, _, err := term.GetSize(1)
+	if err != nil {
+		width = 80
+	}
+
+	fmt.Printf("%s is in:\n", arg)
+	for _, r := range w.repos {
+		var tags []string
+		maxLen := 0
+		const pad = 2
+		for tag, commit := range r.st.Tags {
+			if checkCommit(r, commit) {
+				tags = append(tags, tag)
+				maxLen = max(maxLen, len(tag))
+			}
+		}
+		if maxLen > 0 {
+			fmt.Printf("  repo: %s\n", r.cfg.Name)
+			cols := max(1, (width-4)/(maxLen+pad))
+			slices.Sort(tags)
+			os.Stdout.WriteString("    ")
+			for i, t := range tags {
+				os.Stdout.WriteString(t + strings.Repeat(" ", maxLen-len(t)+pad))
+				if (i+1)%cols == 0 && i != len(tags)-1 {
+					os.Stdout.WriteString("\n    ")
+				}
+			}
+			os.Stdout.WriteString("\n")
 		}
 	}
-	return out
 }
 
 func (w *whatrel) persistState(stateFile string) {
@@ -309,7 +387,7 @@ func main() {
 		fatalIfErr(err)
 	}
 
-	if w.st.SchemaVersion != SchemaVersion {
+	if w.st.SchemaVersion != SchemaVersion || *resetState {
 		// schema changed, reset state
 		w.st = State{
 			SchemaVersion: SchemaVersion,
@@ -351,7 +429,6 @@ func main() {
 	}
 
 	for _, arg := range flag.Args() {
-		tags := w.findTags(arg)
-		fmt.Println(arg, "is in tags", tags)
+		w.findTags(arg)
 	}
 }
