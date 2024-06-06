@@ -68,6 +68,7 @@ type (
 		st         State
 		repos      map[string]*repo
 		ignoreDeps map[plumbing.Hash]struct{}
+		width      int
 	}
 
 	repo struct {
@@ -395,32 +396,43 @@ func (w *whatrel) findTags(arg string) map[string][]string {
 	return out
 }
 
-func (w *whatrel) printTags(arg string, allTags map[string][]string) {
-	width, _, err := term.GetSize(1)
-	if err != nil {
-		width = 80
+func (w *whatrel) printCols(things []string, indent int) {
+	const pad = 2
+
+	if w.width == 0 {
+		var err error
+		w.width, _, err = term.GetSize(1)
+		if err != nil {
+			w.width = 80
+		}
 	}
+
+	maxLen := 0
+	for _, t := range things {
+		maxLen = max(maxLen, len(t))
+	}
+
+	if maxLen > 0 {
+		cols := max(1, (w.width-indent)/(maxLen+pad))
+		slices.Sort(things)
+		os.Stdout.WriteString(strings.Repeat(" ", indent))
+		for i, t := range things {
+			os.Stdout.WriteString(t + strings.Repeat(" ", maxLen-len(t)+pad))
+			if (i+1)%cols == 0 && i != len(things)-1 {
+				os.Stdout.WriteString("\n" + strings.Repeat(" ", indent))
+			}
+		}
+		os.Stdout.WriteString("\n")
+	}
+}
+
+func (w *whatrel) printTags(arg string, allTags map[string][]string) {
 
 	fmt.Printf("%s is in:\n", arg)
 	for _, r := range w.repos {
-		tags := allTags[r.cfg.Name]
-		maxLen := 0
-		const pad = 2
-		for _, tag := range tags {
-			maxLen = max(maxLen, len(tag))
-		}
-		if maxLen > 0 {
+		if tags := allTags[r.cfg.Name]; len(tags) > 0 {
 			fmt.Printf("  repo: %s\n", r.cfg.Name)
-			cols := max(1, (width-4)/(maxLen+pad))
-			slices.Sort(tags)
-			os.Stdout.WriteString("    ")
-			for i, t := range tags {
-				os.Stdout.WriteString(t + strings.Repeat(" ", maxLen-len(t)+pad))
-				if (i+1)%cols == 0 && i != len(tags)-1 {
-					os.Stdout.WriteString("\n    ")
-				}
-			}
-			os.Stdout.WriteString("\n")
+			w.printCols(tags, 4)
 		}
 	}
 }
@@ -440,8 +452,10 @@ func (w *whatrel) findDeploy(arg string, allTags map[string][]string, deployStat
 				tags[i] = normalize(t)
 			}
 			var found []string
+			all := 0
 			for tag, things := range deployState[r.cfg.DeployKey] {
 				thingsKeys := maps.Keys(things)
+				all += len(thingsKeys)
 				tag, multi, ok := strings.Cut(tag, "{")
 				if ok {
 					multi = strings.TrimSuffix(multi, "}")
@@ -464,12 +478,12 @@ func (w *whatrel) findDeploy(arg string, allTags map[string][]string, deployStat
 					found = append(found, thingsKeys...)
 				}
 			}
-			if len(found) > 0 {
+			if len(found) == all {
+				fmt.Printf("  %s: ALL\n", r.cfg.DeployKey)
+			} else if len(found) > 0 {
 				fmt.Printf("  %s:\n", r.cfg.DeployKey)
 				slices.Sort(found)
-				for _, f := range found {
-					fmt.Printf("    %s\n", f)
-				}
+				w.printCols(found, 4)
 			}
 		}
 	}
