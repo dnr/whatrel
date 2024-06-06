@@ -31,12 +31,11 @@ const SchemaVersion = 3
 
 type (
 	Config struct {
-		Repos      []*RepoConfig
+		Repos      map[string]*RepoConfig
 		IgnoreDeps []string
 	}
 
 	RepoConfig struct {
-		Name      string
 		Url       string
 		DeployKey string
 	}
@@ -72,6 +71,7 @@ type (
 	}
 
 	repo struct {
+		name          string
 		cfg           *RepoConfig
 		st            *RepoState
 		git           *git.Repository
@@ -122,13 +122,13 @@ func parseGitModules(contents string) (map[string]string, error) {
 }
 
 func (w *whatrel) loadRepo(cacheBase string, r *repo) {
-	dir := filepath.Join(cacheBase, "repo-"+r.cfg.Name)
+	dir := filepath.Join(cacheBase, "repo-"+r.name)
 	if st, err := os.Stat(dir); err == nil {
 		// have already
 		r.git = must(git.PlainOpen(dir))
 		if r.refreshedRepo = time.Since(st.ModTime()) > *refreshInterval; r.refreshedRepo {
 			// too old, refresh
-			log.Println("fetching", r.cfg.Name)
+			log.Println("fetching", r.name)
 			fatalIfErr(r.git.Fetch(&git.FetchOptions{
 				Tags:     git.AllTags,
 				Prune:    true,
@@ -143,7 +143,7 @@ func (w *whatrel) loadRepo(cacheBase string, r *repo) {
 	}
 
 	// do initial clone
-	log.Println("initial clone of", r.cfg.Name)
+	log.Println("initial clone of", r.name)
 	r.git = must(git.PlainClone(dir, true, &git.CloneOptions{
 		URL:      r.cfg.Url,
 		Mirror:   true,
@@ -156,7 +156,7 @@ func (w *whatrel) loadTags(r *repo) {
 	if !r.refreshedRepo && !*resetState {
 		return
 	}
-	log.Println("loading tags on", r.cfg.Name)
+	log.Println("loading tags on", r.name)
 	must(r.git.Tags()).ForEach(func(ref *plumbing.Reference) error {
 		tagName := strings.TrimPrefix(ref.Name().String(), "refs/tags/")
 		commit := ref.Hash()
@@ -181,7 +181,7 @@ func (w *whatrel) loadGoModMap(r *repo) {
 	if !r.newTags && !*resetState {
 		return
 	}
-	log.Println("loading go mod map from commits on", r.cfg.Name)
+	log.Println("loading go mod map from commits on", r.name)
 	// look at tags only to be faster. in theory this may miss some mod names if they were
 	// never tagged.
 	for _, commit := range r.st.Tags {
@@ -192,7 +192,7 @@ func (w *whatrel) loadGoModMap(r *repo) {
 func (w *whatrel) loadGoModMapFrom(r *repo, commit plumbing.Hash) {
 	c, err := r.git.CommitObject(commit)
 	if err != nil {
-		log.Printf("can't find commit %s in %s", commit, r.cfg.Name)
+		log.Printf("can't find commit %s in %s", commit, r.name)
 		return
 	}
 	f, err := c.File("go.mod")
@@ -206,10 +206,10 @@ func (w *whatrel) loadGoModMapFrom(r *repo, commit plumbing.Hash) {
 	}
 	// update gomodmap
 	if prev, ok := w.st.GoModMap[mod.Module.Mod.Path]; !ok {
-		w.st.GoModMap[mod.Module.Mod.Path] = r.cfg.Name
+		w.st.GoModMap[mod.Module.Mod.Path] = r.name
 		w.st.Modified = true
-	} else if prev != r.cfg.Name {
-		panic(fmt.Sprintf("go mod conflict %s vs %s for %s", r.cfg.Name, prev, mod.Module.Mod.Path))
+	} else if prev != r.name {
+		panic(fmt.Sprintf("go mod conflict %s vs %s for %s", r.name, prev, mod.Module.Mod.Path))
 	}
 }
 
@@ -217,7 +217,7 @@ func (w *whatrel) loadCommits(r *repo) {
 	if !r.newTags && !*resetState {
 		return
 	}
-	log.Println("loading commits on", r.cfg.Name)
+	log.Println("loading commits on", r.name)
 	for _, commit := range r.st.Tags {
 		w.loadCommit(r, commit)
 	}
@@ -230,7 +230,7 @@ func (w *whatrel) loadCommit(r *repo, commit plumbing.Hash) {
 
 	c, err := r.git.CommitObject(commit)
 	if err != nil {
-		log.Printf("can't find commit %s in %s", commit, r.cfg.Name)
+		log.Printf("can't find commit %s in %s", commit, r.name)
 		return
 	}
 
@@ -257,7 +257,7 @@ func (w *whatrel) loadCommit(r *repo, commit plumbing.Hash) {
 				if depName, ok := w.st.GoModMap[p]; ok {
 					depR := w.repos[depName]
 					if v == "" {
-						log.Printf("version for %s in %s is empty", depName, r.cfg.Name)
+						log.Printf("version for %s in %s is empty", depName, r.name)
 					} else if module.IsPseudoVersion(v) {
 						rev := must(module.PseudoVersionRev(v))
 						revBytes := must(hex.DecodeString(rev))
@@ -268,7 +268,7 @@ func (w *whatrel) loadCommit(r *repo, commit plumbing.Hash) {
 								deps[depName] = hash
 							}
 						} else {
-							log.Printf("version for %s in %s is %s, but found %d hashes", depName, r.cfg.Name, v, len(hashes))
+							log.Printf("version for %s in %s is %s, but found %d hashes", depName, r.name, v, len(hashes))
 						}
 					} else {
 						if hash, ok := depR.st.Tags[v]; ok {
@@ -276,7 +276,7 @@ func (w *whatrel) loadCommit(r *repo, commit plumbing.Hash) {
 								deps[depName] = hash
 							}
 						} else {
-							log.Printf("version for %s in %s is %s, but is unknown tag", depName, r.cfg.Name, v)
+							log.Printf("version for %s in %s is %s, but is unknown tag", depName, r.name, v)
 						}
 					}
 				}
@@ -293,14 +293,14 @@ func (w *whatrel) loadCommit(r *repo, commit plumbing.Hash) {
 					tree := must(c.Tree())
 					ent, err := tree.FindEntry(path)
 					if err == nil {
-						deps[depR.cfg.Name] = ent.Hash
+						deps[depR.name] = ent.Hash
 					} else {
-						log.Printf("submodule at %s not found in %s@%s", path, r.cfg.Name, c.Hash)
+						log.Printf("submodule at %s not found in %s@%s", path, r.name, c.Hash)
 					}
 				}
 			}
 		} else {
-			log.Printf("error parsing .gitmodules in %s@%s", r.cfg.Name, c.Hash)
+			log.Printf("error parsing .gitmodules in %s@%s", r.name, c.Hash)
 		}
 	}
 
@@ -356,13 +356,13 @@ func (w *whatrel) findTags(arg string) map[string][]string {
 	var checkCommit func(r *repo, c plumbing.Hash) bool
 	checkCommit = func(r *repo, c plumbing.Hash) bool {
 		k := key{c: c}
-		copy(k.n[:], r.cfg.Name)
+		copy(k.n[:], r.name)
 
 		if val, ok := cache[k]; ok {
 			return val
 		}
 		ci := r.st.Commits[c]
-		if r.cfg.Name == name && matchTitle(ci.Title) {
+		if r.name == name && matchTitle(ci.Title) {
 			cache[k] = true
 			return true
 		}
@@ -391,7 +391,7 @@ func (w *whatrel) findTags(arg string) map[string][]string {
 				tags = append(tags, tag)
 			}
 		}
-		out[r.cfg.Name] = tags
+		out[r.name] = tags
 	}
 	return out
 }
@@ -430,8 +430,8 @@ func (w *whatrel) printTags(arg string, allTags map[string][]string) {
 
 	fmt.Printf("%s is in:\n", arg)
 	for _, r := range w.repos {
-		if tags := allTags[r.cfg.Name]; len(tags) > 0 {
-			fmt.Printf("  repo: %s\n", r.cfg.Name)
+		if tags := allTags[r.name]; len(tags) > 0 {
+			fmt.Printf("  repo: %s\n", r.name)
 			w.printCols(tags, 4)
 		}
 	}
@@ -447,7 +447,7 @@ func (w *whatrel) findDeploy(arg string, allTags map[string][]string, deployStat
 	fmt.Printf("%s is on:\n", arg)
 	for _, r := range w.repos {
 		if r.cfg.DeployKey != "" {
-			tags := allTags[r.cfg.Name]
+			tags := allTags[r.name]
 			for i, t := range tags {
 				tags[i] = normalize(t)
 			}
@@ -557,17 +557,16 @@ func main() {
 	defer w.persistState(stateFile)
 
 	w.repos = make(map[string]*repo)
-	for _, r := range w.cfg.Repos {
-		rst := w.st.Repos[r.Name]
+	for name, r := range w.cfg.Repos {
+		rst := w.st.Repos[name]
 		if rst == nil {
 			rst = &RepoState{
 				Tags:    make(map[string]plumbing.Hash),
 				Commits: make(map[plumbing.Hash]CommitInfo),
 			}
-			w.st.Repos[r.Name] = rst
+			w.st.Repos[name] = rst
 		}
-		repo := &repo{cfg: r, st: rst}
-		w.repos[r.Name] = repo
+		w.repos[name] = &repo{name: name, cfg: r, st: rst}
 	}
 	for _, r := range w.repos {
 		w.loadRepo(cacheBase, r)
