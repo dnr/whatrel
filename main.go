@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/gob"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/exp/maps"
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/module"
 	"golang.org/x/term"
@@ -29,14 +31,14 @@ const SchemaVersion = 3
 
 type (
 	Config struct {
-		Repos            []*RepoConfig
-		IgnoreDeps       []string
-		DefaultDeployKey string
+		Repos      []*RepoConfig
+		IgnoreDeps []string
 	}
 
 	RepoConfig struct {
-		Name string
-		Url  string
+		Name      string
+		Url       string
+		DeployKey string
 	}
 
 	// vvv --- persisted --- vvv
@@ -80,11 +82,14 @@ type (
 var (
 	// tagAge          = flag.Int("age", 30, "how many days back to list tags")
 	refreshInterval = flag.Duration("refresh_interval", time.Hour, "how often to refresh git repo cache")
+	deploy          = flag.Bool("deploy", false, "find deployments instead of tags")
 	resetState      = flag.Bool("reset", false, "")
 	dumpState       = flag.Bool("dump", false, "")
 
 	versionTagRe = regexp.MustCompile("^v[0-9]")
 	digitsRe     = regexp.MustCompile("^[0-9]+$")
+	subModPathRe = regexp.MustCompile(`^\[submodule "([^"]+)"\]$`)
+	subModUrlRe  = regexp.MustCompile(`url\s*=\s*(\S*)`)
 )
 
 func fatalIfErr(err error) {
@@ -99,16 +104,13 @@ func must[T any](t T, err error) T {
 	return t
 }
 
-var _re_submpath = regexp.MustCompile(`^\[submodule "([^"]+)"\]$`)
-var _re_submurl = regexp.MustCompile(`url\s*=\s*(\S*)`)
-
 func parseGitModules(contents string) (map[string]string, error) {
 	out := make(map[string]string) // path -> url
 	var path string
 	for _, line := range strings.Split(contents, "\n") {
-		if m := _re_submpath.FindStringSubmatch(line); m != nil {
+		if m := subModPathRe.FindStringSubmatch(line); m != nil {
 			path = m[1]
-		} else if m := _re_submurl.FindStringSubmatch(line); m != nil {
+		} else if m := subModUrlRe.FindStringSubmatch(line); m != nil {
 			if path == "" {
 				return nil, errors.New("url without path")
 			}
@@ -325,7 +327,7 @@ func (w *whatrel) findByUrl(url string) *repo {
 	return nil
 }
 
-func (w *whatrel) findTags(arg string) {
+func (w *whatrel) findTags(arg string) map[string][]string {
 	// form: repo#pr or repo#text
 	name, pr, found := strings.Cut(arg, "#")
 	if !found {
@@ -380,6 +382,20 @@ func (w *whatrel) findTags(arg string) {
 		return val
 	}
 
+	out := make(map[string][]string)
+	for _, r := range w.repos {
+		var tags []string
+		for tag, commit := range r.st.Tags {
+			if checkCommit(r, commit) {
+				tags = append(tags, tag)
+			}
+		}
+		out[r.cfg.Name] = tags
+	}
+	return out
+}
+
+func (w *whatrel) printTags(arg string, allTags map[string][]string) {
 	width, _, err := term.GetSize(1)
 	if err != nil {
 		width = 80
@@ -387,14 +403,11 @@ func (w *whatrel) findTags(arg string) {
 
 	fmt.Printf("%s is in:\n", arg)
 	for _, r := range w.repos {
-		var tags []string
+		tags := allTags[r.cfg.Name]
 		maxLen := 0
 		const pad = 2
-		for tag, commit := range r.st.Tags {
-			if checkCommit(r, commit) {
-				tags = append(tags, tag)
-				maxLen = max(maxLen, len(tag))
-			}
+		for _, tag := range tags {
+			maxLen = max(maxLen, len(tag))
 		}
 		if maxLen > 0 {
 			fmt.Printf("  repo: %s\n", r.cfg.Name)
@@ -408,6 +421,56 @@ func (w *whatrel) findTags(arg string) {
 				}
 			}
 			os.Stdout.WriteString("\n")
+		}
+	}
+}
+
+func (w *whatrel) findDeploy(arg string, allTags map[string][]string, deployState map[string]map[string]map[string]any) {
+	normalize := func(s string) string {
+		s = strings.TrimPrefix(s, "v")
+		s = strings.Replace(s, "+", "_", -1)
+		s = strings.Replace(s, "-", "_", -1)
+		return s
+	}
+	fmt.Printf("%s is on:\n", arg)
+	for _, r := range w.repos {
+		if r.cfg.DeployKey != "" {
+			tags := allTags[r.cfg.Name]
+			for i, t := range tags {
+				tags[i] = normalize(t)
+			}
+			var found []string
+			for tag, things := range deployState[r.cfg.DeployKey] {
+				thingsKeys := maps.Keys(things)
+				tag, multi, ok := strings.Cut(tag, "{")
+				if ok {
+					multi = strings.TrimSuffix(multi, "}")
+					var have []string
+					for _, m := range strings.Split(multi, ",") {
+						if k, v, ok := strings.Cut(m, ":"); ok {
+							if slices.Contains(tags, strings.TrimSpace(v)) {
+								have = append(have, strings.TrimSpace(k))
+							}
+						}
+					}
+					if len(have) == len(strings.Split(multi, ",")) {
+						found = append(found, thingsKeys...)
+					} else if len(have) > 0 {
+						for _, thing := range thingsKeys {
+							found = append(found, fmt.Sprintf("%s [%s]", thing, strings.Join(have, ", ")))
+						}
+					}
+				} else if slices.Contains(tags, tag) {
+					found = append(found, thingsKeys...)
+				}
+			}
+			if len(found) > 0 {
+				fmt.Printf("  %s:\n", r.cfg.DeployKey)
+				slices.Sort(found)
+				for _, f := range found {
+					fmt.Printf("    %s\n", f)
+				}
+			}
 		}
 	}
 }
@@ -505,7 +568,17 @@ func main() {
 		w.loadCommits(r)
 	}
 
-	for _, arg := range flag.Args() {
-		w.findTags(arg)
+	if *deploy {
+		var deployState map[string]map[string]map[string]any
+		fatalIfErr(json.NewDecoder(os.Stdin).Decode(&deployState))
+		for _, arg := range flag.Args() {
+			tags := w.findTags(arg)
+			w.findDeploy(arg, tags, deployState)
+		}
+	} else {
+		for _, arg := range flag.Args() {
+			tags := w.findTags(arg)
+			w.printTags(arg, tags)
+		}
 	}
 }
