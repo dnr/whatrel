@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -27,17 +28,18 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const SchemaVersion = 3
+const SchemaVersion = 4
 
 type (
 	Config struct {
-		Repos      map[string]*RepoConfig
-		IgnoreDeps []string
+		Repos         map[string]*RepoConfig `yaml:"repos"`
+		IgnoreDeps    []string               `yaml:"ignoreDeps"`
+		DeployCommand string                 `yaml:"deployCommand"`
 	}
 
 	RepoConfig struct {
-		Url       string
-		DeployKey string
+		Url       string `yaml:"url"`
+		DeployKey string `yaml:"deployKey"`
 	}
 
 	// vvv --- persisted --- vvv
@@ -55,8 +57,9 @@ type (
 	}
 
 	CommitInfo struct {
-		Parents []plumbing.Hash
 		Title   string
+		CTime   int64
+		Parents []plumbing.Hash
 		Deps    map[string]plumbing.Hash
 	}
 
@@ -78,6 +81,12 @@ type (
 		refreshedRepo bool
 		newTags       bool
 	}
+
+	commit struct {
+		repo string
+		ci   CommitInfo
+		hash plumbing.Hash
+	}
 )
 
 var (
@@ -91,6 +100,7 @@ var (
 	digitsRe     = regexp.MustCompile("^[0-9]+$")
 	subModPathRe = regexp.MustCompile(`^\[submodule "([^"]+)"\]$`)
 	subModUrlRe  = regexp.MustCompile(`url\s*=\s*(\S*)`)
+	hashRe       = regexp.MustCompile(`^[0-9a-f]+$`)
 )
 
 func fatalIfErr(err error) {
@@ -119,6 +129,11 @@ func parseGitModules(contents string) (map[string]string, error) {
 		}
 	}
 	return out, nil
+}
+
+func (c *commit) String() string {
+	t := time.Unix(c.ci.CTime, 0).Format("2006-01-02 15:04:05")
+	return fmt.Sprintf("%s  %x  %s  \u00ab%s\u00bb", c.repo, c.hash[:6], t, c.ci.Title)
 }
 
 func (w *whatrel) loadRepo(cacheBase string, r *repo) {
@@ -236,11 +251,6 @@ func (w *whatrel) loadCommit(r *repo, commit plumbing.Hash) {
 
 	title, _, _ := strings.Cut(c.Message, "\n")
 
-	parents := make([]plumbing.Hash, c.NumParents())
-	for i := range parents {
-		parents[i] = must(c.Parent(i)).Hash
-	}
-
 	// get go.mod if present
 	deps := make(map[string]plumbing.Hash)
 	if f, err := c.File("go.mod"); err == nil {
@@ -306,10 +316,11 @@ func (w *whatrel) loadCommit(r *repo, commit plumbing.Hash) {
 
 	r.st.Commits[commit] = CommitInfo{
 		Title:   title,
-		Parents: parents,
+		CTime:   c.Committer.When.Unix(),
+		Parents: c.ParentHashes,
 		Deps:    deps,
 	}
-	for _, commit := range parents {
+	for _, commit := range c.ParentHashes {
 		w.loadCommit(r, commit)
 	}
 	for depName, commit := range deps {
@@ -328,25 +339,66 @@ func (w *whatrel) findByUrl(url string) *repo {
 	return nil
 }
 
-func (w *whatrel) findTags(arg string) map[string][]string {
-	// form: repo#pr or repo#text
-	name, pr, found := strings.Cut(arg, "#")
-	if !found {
-		log.Fatalln("arg must be in form repo#pr or repo#text")
+func (w *whatrel) findCommits(args []string) []commit {
+	// form: repo#pr or repo#text or hash prefix
+	var out []commit
+
+	for _, arg := range args {
+		name, rest, found := strings.Cut(arg, "#")
+		if !found {
+			if !hashRe.MatchString(arg) {
+				log.Fatalln("arg must be: commit | repo#pr | repo#title")
+			}
+			fullArg := arg
+			if len(arg)%2 == 1 {
+				arg = arg[:len(arg)-1]
+			}
+			hashBytes := must(hex.DecodeString(arg))
+			for _, r := range w.repos {
+				for _, hash := range must(r.git.Storer.(*filesystem.Storage).HashesWithPrefix(hashBytes)) {
+					if !strings.HasPrefix(hash.String(), fullArg) {
+						continue
+					}
+					if ci, ok := r.st.Commits[hash]; ok {
+						out = append(out, commit{
+							repo: r.name,
+							ci:   ci,
+							hash: hash,
+						})
+					}
+				}
+			}
+		} else {
+			r := w.repos[name]
+			if r == nil {
+				log.Fatalln("unknown repo:", name)
+			}
+
+			var match func(string) bool
+
+			if digitsRe.MatchString(rest) {
+				suffix := " (#" + rest + ")"
+				match = func(title string) bool { return strings.HasSuffix(title, suffix) }
+			} else {
+				match = func(title string) bool { return strings.Contains(title, rest) }
+			}
+
+			for hash, ci := range r.st.Commits {
+				if match(ci.Title) {
+					out = append(out, commit{
+						repo: r.name,
+						ci:   ci,
+						hash: hash,
+					})
+				}
+			}
+		}
 	}
 
-	var matchTitle func(string) bool
-	if digitsRe.MatchString(pr) {
-		suffix := " (#" + pr + ")"
-		matchTitle = func(title string) bool {
-			return strings.HasSuffix(title, suffix)
-		}
-	} else {
-		matchTitle = func(title string) bool {
-			return strings.Contains(title, pr)
-		}
-	}
+	return out
+}
 
+func (w *whatrel) findTags(commit commit) map[string][]string {
 	type key struct {
 		c plumbing.Hash
 		n [12]byte
@@ -354,40 +406,41 @@ func (w *whatrel) findTags(arg string) map[string][]string {
 	cache := make(map[key]bool, 10000)
 
 	var checkCommit func(r *repo, c plumbing.Hash) bool
-	checkCommit = func(r *repo, c plumbing.Hash) bool {
+	checkCommit = func(r *repo, c plumbing.Hash) (retBool bool) {
+		if c == commit.hash {
+			return true
+		}
+
 		k := key{c: c}
 		copy(k.n[:], r.name)
 
 		if val, ok := cache[k]; ok {
 			return val
 		}
+
+		defer func() {
+			cache[k] = retBool
+		}()
+
 		ci := r.st.Commits[c]
-		if r.name == name && matchTitle(ci.Title) {
-			cache[k] = true
-			return true
-		}
-		val := false
 		for _, p := range ci.Parents {
 			if checkCommit(r, p) {
-				val = true
-				break
+				return true
 			}
 		}
 		for depName, depC := range ci.Deps {
 			if checkCommit(w.repos[depName], depC) {
-				val = true
-				break
+				return true
 			}
 		}
-		cache[k] = val
-		return val
+		return false
 	}
 
 	out := make(map[string][]string)
 	for _, r := range w.repos {
 		var tags []string
-		for tag, commit := range r.st.Tags {
-			if checkCommit(r, commit) {
+		for tag, c := range r.st.Tags {
+			if checkCommit(r, c) {
 				tags = append(tags, tag)
 			}
 		}
@@ -426,9 +479,8 @@ func (w *whatrel) printCols(things []string, indent int) {
 	}
 }
 
-func (w *whatrel) printTags(arg string, allTags map[string][]string) {
-
-	fmt.Printf("%s is in:\n", arg)
+func (w *whatrel) printTags(commit commit, allTags map[string][]string) {
+	fmt.Printf("%s is in:\n", commit.String())
 	for _, r := range w.repos {
 		if tags := allTags[r.name]; len(tags) > 0 {
 			fmt.Printf("  repo: %s\n", r.name)
@@ -437,14 +489,14 @@ func (w *whatrel) printTags(arg string, allTags map[string][]string) {
 	}
 }
 
-func (w *whatrel) findDeploy(arg string, allTags map[string][]string, deployState map[string]map[string]map[string]any) {
+func (w *whatrel) findDeploy(commit commit, allTags map[string][]string, deployState map[string]map[string]map[string]any) {
 	normalize := func(s string) string {
 		s = strings.TrimPrefix(s, "v")
 		s = strings.Replace(s, "+", "_", -1)
 		s = strings.Replace(s, "-", "_", -1)
 		return s
 	}
-	fmt.Printf("%s is on:\n", arg)
+	fmt.Printf("%s is on:\n", commit.String())
 	for _, r := range w.repos {
 		if r.cfg.DeployKey != "" {
 			tags := allTags[r.name]
@@ -581,17 +633,22 @@ func main() {
 		w.loadCommits(r)
 	}
 
+	commits := w.findCommits(flag.Args())
+
 	if *deploy {
 		var deployState map[string]map[string]map[string]any
-		fatalIfErr(json.NewDecoder(os.Stdin).Decode(&deployState))
-		for _, arg := range flag.Args() {
-			tags := w.findTags(arg)
-			w.findDeploy(arg, tags, deployState)
+		cmd := exec.Command("sh", "-c", w.cfg.DeployCommand)
+		cmd.Stderr = os.Stderr
+		stateBytes := must(cmd.Output())
+		fatalIfErr(json.Unmarshal(stateBytes, &deployState))
+		for _, commit := range commits {
+			tags := w.findTags(commit)
+			w.findDeploy(commit, tags, deployState)
 		}
 	} else {
-		for _, arg := range flag.Args() {
-			tags := w.findTags(arg)
-			w.printTags(arg, tags)
+		for _, commit := range commits {
+			tags := w.findTags(commit)
+			w.printTags(commit, tags)
 		}
 	}
 }
