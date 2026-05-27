@@ -266,6 +266,9 @@ func (w *whatrel) loadCommit(r *repo, commit plumbing.Hash) {
 				// find in state
 				if depName, ok := w.st.GoModMap[p]; ok {
 					depR := w.repos[depName]
+					if depR == nil {
+						continue
+					}
 					if v == "" {
 						log.Printf("version for %s in %s is empty", depName, r.name)
 					} else if module.IsPseudoVersion(v) {
@@ -429,7 +432,11 @@ func (w *whatrel) findTags(commit commit) map[string][]string {
 			}
 		}
 		for depName, depC := range ci.Deps {
-			if checkCommit(w.repos[depName], depC) {
+			depR := w.repos[depName]
+			if depR == nil {
+				continue
+			}
+			if checkCommit(depR, depC) {
 				return true
 			}
 		}
